@@ -7,32 +7,40 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Map mein sabhi connected phones ki list store hogi { deviceId: wsConnection }
 const connectedNodes = new Map();
+const pendingRequests = new Map();
 
 wss.on('connection', (ws, req) => {
     const parameters = url.parse(req.url, true).query;
     const deviceId = parameters.device_id || 'unknown_device';
 
-    // Phone ko list mein save kar liya
     connectedNodes.set(deviceId, ws);
     console.log(`[+] Phone Connected: Device ID -> ${deviceId}`);
 
-    // Jab phone se koi response wapas aaye
+    // Jab phone se website ka data wapas aayega
     ws.on('message', (message) => {
         console.log(`[Data] Received response from device ${deviceId}`);
-        // Yahan aap us data ko apne client/scraper ko bhej sakte hain
+        
+        const resObj = pendingRequests.get(deviceId);
+        if (resObj) {
+            resObj.send(message.toString()); // Asli website ka data browser ko bhej diya
+            pendingRequests.delete(deviceId);
+        }
     });
 
-    // Jab phone disconnect ho jaye
     ws.on('close', () => {
         connectedNodes.delete(deviceId);
+        const resObj = pendingRequests.get(deviceId);
+        if (resObj) {
+            resObj.status(500).send({ error: 'Phone disconnected before sending response' });
+            pendingRequests.delete(deviceId);
+        }
         console.log(`[-] Phone Disconnected: Device ID -> ${deviceId}`);
     });
 });
 
-// Ek API endpoint jisse aap baahar se request bhej sakein ki kis phone ke through data chahiye
-app.get('/proxy', express.json(), async (req, res) => {
+// Proxy endpoint
+app.get('/proxy', (req, res) => {
     const { deviceId, targetUrl } = req.query;
 
     if (!deviceId || !targetUrl) {
@@ -44,9 +52,17 @@ app.get('/proxy', express.json(), async (req, res) => {
         return res.status(404).send({ error: 'Target phone node is offline!' });
     }
 
-    // Request ko phone ke WebSocket par bhej do
+    // Agar pehle ki koi request pending hai toh use close kar do
+    if (pendingRequests.has(deviceId)) {
+        const oldRes = pendingRequests.get(deviceId);
+        oldRes.status(500).send({ error: 'New request replaced old one' });
+    }
+
+    // Browser ke response object ko save karke rakho jab tak phone jawab na de
+    pendingRequests.set(deviceId, res);
+
+    // Phone ke WebSocket par target URL bhej do
     nodeWs.send(targetUrl);
-    res.send({ status: 'Request sent to phone node, waiting for response...' });
 });
 
 const PORT = process.env.PORT || 8000;
