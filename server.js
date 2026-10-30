@@ -4,36 +4,46 @@ const url = require('url');
 const crypto = require('crypto');
 
 const server = http.createServer((req, res) => {
-    // AdsPower jab proxy ke through request bhejta hai, toh req.url me poora absolute URL hota hai (jaise http://ip-api.com/json)
     const targetUrl = req.url;
 
     if (!targetUrl || targetUrl === '/' || targetUrl.startsWith('/ws')) {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Mobile Proxy Server for AdsPower is Running!\n');
+        res.end('Multi-Device Mobile Proxy Server is Running!\n');
         return;
     }
 
-    // Connected phone node ko fetch karein (abhi ke liye jo phone connected hai)
-    const deviceId = Array.from(connectedNodes.keys())[0];
+    // AdsPower proxy authentication header se deviceId (username) nikalna
+    const authHeader = req.headers['proxy-authorization'];
+    let deviceId = null;
+
+    if (authHeader && authHeader.startsWith('Basic ')) {
+        const base64Credentials = authHeader.split(' ')[1];
+        const credentials = Buffer.from(base64Credentials, 'base64').toString('ascii');
+        // Format: username:password hota hai, hum username ko deviceId maan rahe hain
+        deviceId = credentials.split(':')[0];
+    }
+
+    if (!deviceId || !connectedNodes.has(deviceId)) {
+        res.writeHead(407, { 
+            'Content-Type': 'text/plain',
+            'Proxy-Authenticate': 'Basic realm="Enter your Device ID as Proxy Username"'
+        });
+        res.end('Proxy Error: Invalid or Missing Device ID in Proxy Username');
+        return;
+    }
+
     const nodeWs = connectedNodes.get(deviceId);
-
-    if (!deviceId || !nodeWs) {
-        res.writeHead(503, { 'Content-Type': 'text/plain' });
-        res.end('Proxy Error: No phone node connected online');
-        return;
-    }
-
     const requestId = crypto.randomUUID();
     pendingRequests.set(requestId, res);
 
-    // Phone ko WebSocket ke zariye target URL bhejo
+    // Specific phone node ko target URL bhejo
     nodeWs.send(JSON.stringify({ requestId, targetUrl }));
 
     // 30 seconds Timeout
     setTimeout(() => {
         if (pendingRequests.has(requestId)) {
             pendingRequests.get(requestId).writeHead(504, { 'Content-Type': 'text/plain' });
-            pendingRequests.get(requestId).end('Gateway Timeout: Phone took too long');
+            pendingRequests.get(requestId).end('Gateway Timeout: Phone took too long to respond');
             pendingRequests.delete(requestId);
         }
     }, 30000);
@@ -66,7 +76,6 @@ wss.on('connection', (ws, req) => {
                     clientRes.writeHead(500, { 'Content-Type': 'text/plain' });
                     clientRes.end(error);
                 } else {
-                    // Website ka data wapas AdsPower/Browser ko bhej do
                     clientRes.writeHead(200, { 'Content-Type': 'text/html' });
                     clientRes.end(responseBody);
                 }
@@ -85,5 +94,5 @@ wss.on('connection', (ws, req) => {
 
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
-    console.log(`AdsPower HTTP Proxy Server running on port ${PORT}`);
+    console.log(`Multi-Device Proxy Server running on port ${PORT}`);
 });
