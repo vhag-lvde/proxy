@@ -1,71 +1,89 @@
-const express = require('express');
-const { WebSocketServer } = require('ws');
 const http = require('http');
+const { WebSocketServer } = require('ws');
 const url = require('url');
+const crypto = require('crypto');
 
-const app = express();
-const server = http.createServer(app);
+const server = http.createServer((req, res) => {
+    // AdsPower jab proxy ke through request bhejta hai, toh req.url me poora absolute URL hota hai (jaise http://ip-api.com/json)
+    const targetUrl = req.url;
+
+    if (!targetUrl || targetUrl === '/' || targetUrl.startsWith('/ws')) {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Mobile Proxy Server for AdsPower is Running!\n');
+        return;
+    }
+
+    // Connected phone node ko fetch karein (abhi ke liye jo phone connected hai)
+    const deviceId = Array.from(connectedNodes.keys())[0];
+    const nodeWs = connectedNodes.get(deviceId);
+
+    if (!deviceId || !nodeWs) {
+        res.writeHead(503, { 'Content-Type': 'text/plain' });
+        res.end('Proxy Error: No phone node connected online');
+        return;
+    }
+
+    const requestId = crypto.randomUUID();
+    pendingRequests.set(requestId, res);
+
+    // Phone ko WebSocket ke zariye target URL bhejo
+    nodeWs.send(JSON.stringify({ requestId, targetUrl }));
+
+    // 30 seconds Timeout
+    setTimeout(() => {
+        if (pendingRequests.has(requestId)) {
+            pendingRequests.get(requestId).writeHead(504, { 'Content-Type': 'text/plain' });
+            pendingRequests.get(requestId).end('Gateway Timeout: Phone took too long');
+            pendingRequests.delete(requestId);
+        }
+    }, 30000);
+});
+
 const wss = new WebSocketServer({ server });
-
 const connectedNodes = new Map();
 const pendingRequests = new Map();
 
 wss.on('connection', (ws, req) => {
     const parameters = url.parse(req.url, true).query;
-    const deviceId = parameters.device_id || 'unknown_device';
+    const deviceId = parameters.device_id;
+
+    if (!deviceId) {
+        ws.close();
+        return;
+    }
 
     connectedNodes.set(deviceId, ws);
     console.log(`[+] Phone Connected: Device ID -> ${deviceId}`);
 
-    // Jab phone se website ka data wapas aayega
     ws.on('message', (message) => {
-        console.log(`[Data] Received response from device ${deviceId}`);
-        
-        const resObj = pendingRequests.get(deviceId);
-        if (resObj) {
-            resObj.send(message.toString()); // Asli website ka data browser ko bhej diya
-            pendingRequests.delete(deviceId);
+        try {
+            const data = JSON.parse(message.toString());
+            const { requestId, responseBody, error } = data;
+
+            const clientRes = pendingRequests.get(requestId);
+            if (clientRes) {
+                if (error) {
+                    clientRes.writeHead(500, { 'Content-Type': 'text/plain' });
+                    clientRes.end(error);
+                } else {
+                    // Website ka data wapas AdsPower/Browser ko bhej do
+                    clientRes.writeHead(200, { 'Content-Type': 'text/html' });
+                    clientRes.end(responseBody);
+                }
+                pendingRequests.delete(requestId);
+            }
+        } catch (e) {
+            console.error('Failed to parse phone response:', e);
         }
     });
 
     ws.on('close', () => {
         connectedNodes.delete(deviceId);
-        const resObj = pendingRequests.get(deviceId);
-        if (resObj) {
-            resObj.status(500).send({ error: 'Phone disconnected before sending response' });
-            pendingRequests.delete(deviceId);
-        }
         console.log(`[-] Phone Disconnected: Device ID -> ${deviceId}`);
     });
 });
 
-// Proxy endpoint
-app.get('/proxy', (req, res) => {
-    const { deviceId, targetUrl } = req.query;
-
-    if (!deviceId || !targetUrl) {
-        return res.status(400).send({ error: 'Please provide deviceId and targetUrl' });
-    }
-
-    const nodeWs = connectedNodes.get(deviceId);
-    if (!nodeWs) {
-        return res.status(404).send({ error: 'Target phone node is offline!' });
-    }
-
-    // Agar pehle ki koi request pending hai toh use close kar do
-    if (pendingRequests.has(deviceId)) {
-        const oldRes = pendingRequests.get(deviceId);
-        oldRes.status(500).send({ error: 'New request replaced old one' });
-    }
-
-    // Browser ke response object ko save karke rakho jab tak phone jawab na de
-    pendingRequests.set(deviceId, res);
-
-    // Phone ke WebSocket par target URL bhej do
-    nodeWs.send(targetUrl);
-});
-
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
-    console.log(`Proxy Relay Server running on port ${PORT}`);
+    console.log(`AdsPower HTTP Proxy Server running on port ${PORT}`);
 });
