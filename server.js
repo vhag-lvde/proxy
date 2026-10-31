@@ -1,88 +1,140 @@
 const http = require('http');
+const net = require('net');
 const { WebSocketServer } = require('ws');
 const url = require('url');
 const crypto = require('crypto');
 
-const server = http.createServer((req, res) => {
-    const targetUrl = req.url;
+const server = http.createServer();
+const wss = new WebSocketServer({ noServer: true });
 
-    if (!targetUrl || targetUrl === '/' || targetUrl.startsWith('/ws')) {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Multi-Device Mobile Proxy Server is Running!\n');
-        return;
-    }
+const connectedNodes = new Map(); // deviceId -> ws connection
+const pendingSockets = new Map(); // tunnelId -> net.Socket or http.ServerResponse
 
-    // AdsPower proxy authentication header se deviceId (username) nikalna
+// Authentication helper
+function authenticateProxy(req) {
     const authHeader = req.headers['proxy-authorization'];
-    let deviceId = null;
-
-    if (authHeader && authHeader.startsWith('Basic ')) {
+    if (!authHeader || !authHeader.startsWith('Basic ')) return null;
+    
+    try {
         const base64Credentials = authHeader.split(' ')[1];
         const credentials = Buffer.from(base64Credentials, 'base64').toString('ascii');
-        // Format: username:password hota hai, hum username ko deviceId maan rahe hain
-        deviceId = credentials.split(':')[0];
+        return credentials.split(':')[0]; // Username is deviceId
+    } catch (e) {
+        return null;
     }
+}
 
+// 1. Handle Standard HTTP Requests
+server.on('request', (req, res) => {
+    const deviceId = authenticateProxy(req);
     if (!deviceId || !connectedNodes.has(deviceId)) {
-        res.writeHead(407, { 
-            'Content-Type': 'text/plain',
-            'Proxy-Authenticate': 'Basic realm="Enter your Device ID as Proxy Username"'
-        });
-        res.end('Proxy Error: Invalid or Missing Device ID in Proxy Username');
+        res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Enter Device ID as Username"' });
+        res.end('Proxy Authentication Required');
         return;
     }
 
-    const nodeWs = connectedNodes.get(deviceId);
-    const requestId = crypto.randomUUID();
-    pendingRequests.set(requestId, res);
+    const ws = connectedNodes.get(deviceId);
+    const tunnelId = crypto.randomUUID();
+    pendingSockets.set(tunnelId, res);
 
-    // Specific phone node ko target URL bhejo
-    nodeWs.send(JSON.stringify({ requestId, targetUrl }));
+    // Send HTTP request details to Android phone
+    ws.send(JSON.stringify({
+        type: 'HTTP',
+        tunnelId,
+        method: req.method,
+        url: req.url,
+        headers: req.headers
+    }));
 
-    // 30 seconds Timeout
-    setTimeout(() => {
-        if (pendingRequests.has(requestId)) {
-            pendingRequests.get(requestId).writeHead(504, { 'Content-Type': 'text/plain' });
-            pendingRequests.get(requestId).end('Gateway Timeout: Phone took too long to respond');
-            pendingRequests.delete(requestId);
-        }
-    }, 30000);
+    req.on('data', chunk => {
+        // Agar POST request me body hai to forward karein (agar zaroorat ho)
+    });
+
+    req.on('close', () => {
+        pendingSockets.delete(tunnelId);
+    });
 });
 
-const wss = new WebSocketServer({ server });
-const connectedNodes = new Map();
-const pendingRequests = new Map();
-
-wss.on('connection', (ws, req) => {
-    const parameters = url.parse(req.url, true).query;
-    const deviceId = parameters.device_id;
-
-    if (!deviceId) {
-        ws.close();
+// 2. Handle HTTPS CONNECT Tunneling (Crucial for AdsPower)
+server.on('connect', (req, clientSocket, head) => {
+    const deviceId = authenticateProxy(req);
+    if (!deviceId || !connectedNodes.has(deviceId)) {
+        clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Enter Device ID"\r\n\r\n');
+        clientSocket.end();
         return;
     }
 
+    const ws = connectedNodes.get(deviceId);
+    const tunnelId = crypto.randomUUID();
+    pendingSockets.set(tunnelId, clientSocket);
+
+    // Tell Android phone to open a TCP socket to the target HTTPS host
+    ws.send(JSON.stringify({
+        type: 'CONNECT',
+        tunnelId,
+        host: req.url // e.g. "example.com:443"
+    }));
+
+    clientSocket.on('close', () => {
+        pendingSockets.delete(tunnelId);
+        ws.send(JSON.stringify({ type: 'CLOSE', tunnelId }));
+    });
+
+    clientSocket.on('error', () => {
+        pendingSockets.delete(tunnelId);
+    });
+});
+
+// 3. Handle WebSocket Connection from Android Phones
+server.on('upgrade', (req, socket, head) => {
+    const parsedUrl = url.parse(req.url, true);
+    const deviceId = parsedUrl.query.device_id;
+
+    if (parsedUrl.pathname === '/ws' && deviceId) {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit('connection', ws, req, deviceId);
+        });
+    } else {
+        socket.destroy();
+    }
+});
+
+wss.on('connection', (ws, req, deviceId) => {
     connectedNodes.set(deviceId, ws);
     console.log(`[+] Phone Connected: Device ID -> ${deviceId}`);
 
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message.toString());
-            const { requestId, responseBody, error } = data;
+    ws.on('message', (message, isBinary) => {
+        // Phone se data binary ya JSON me aa sakta hai (TCP Tunnel data)
+        if (isBinary) {
+            // Binary data for CONNECT tunnels
+            // Format: [4 bytes tunnelId length] + [tunnelId string] + [raw binary data]
+            try {
+                const idLen = message.readUInt32BE(0);
+                const tunnelId = message.toString('utf8', 4, 4 + idLen);
+                const rawData = message.subarray(4 + idLen);
 
-            const clientRes = pendingRequests.get(requestId);
-            if (clientRes) {
-                if (error) {
-                    clientRes.writeHead(500, { 'Content-Type': 'text/plain' });
-                    clientRes.end(error);
-                } else {
-                    clientRes.writeHead(200, { 'Content-Type': 'text/html' });
-                    clientRes.end(responseBody);
+                const socketObj = pendingSockets.get(tunnelId);
+                if (socketObj instanceof net.Socket || socketObj && typeof socketObj.write === 'function') {
+                    socketObj.write(rawData);
                 }
-                pendingRequests.delete(requestId);
+            } catch (e) {
+                console.error('Error parsing binary tunnel data:', e);
             }
-        } catch (e) {
-            console.error('Failed to parse phone response:', e);
+        } else {
+            // JSON response for standard HTTP requests
+            try {
+                const data = JSON.parse(message.toString());
+                const { tunnelId, statusCode, headers, body } = data;
+                const res = pendingSockets.get(tunnelId);
+
+                if (res && typeof res.writeHead === 'function') {
+                    res.writeHead(statusCode || 200, headers || {});
+                    res.end(body);
+                    pendingSockets.delete(tunnelId);
+                }
+            } catch (e) {
+                // Might be tunnel established confirmation
+            }
         }
     });
 
@@ -94,5 +146,5 @@ wss.on('connection', (ws, req) => {
 
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
-    console.log(`Multi-Device Proxy Server running on port ${PORT}`);
+    console.log(`Full HTTP/HTTPS Proxy Tunnel Server running on port ${PORT}`);
 });
